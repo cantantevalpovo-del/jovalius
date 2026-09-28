@@ -1,20 +1,22 @@
 /**
- * The upstream identity providers this app offers for sign-in (via the broker).
+ * The identity providers this app offers for sign-in.
  *
  * Source of truth for BOTH the server (`server.ts`, one `genericOAuth` provider
  * per entry) and the client (`client.ts` / sign-in buttons). Kept in its own
  * dependency-free module so the client can import it without pulling the
  * server-only Better Auth instance (and `pg`) into the browser bundle.
  *
- * Each app federates to the shared **auth broker** (`GROK_AUTH_ISSUER`), which
- * holds the real Google/X secrets. The app never sees them — it only knows its
- * own per-app client id/secret and which upstream to ask the broker for (`idp`).
+ * Two modes (picked server-side in `server.ts`):
+ *   - Self-hosted (e.g. own Vercel project): `GOOGLE_CLIENT_ID` /
+ *     `GOOGLE_CLIENT_SECRET` are set, and the app talks to Google directly.
+ *   - Grok platform / live preview: no Google creds, so sign-in federates to the
+ *     shared Grok auth broker, which picks the upstream from the `idp` hint.
  *
- * To add an upstream (e.g. GitHub) once the broker supports it: add one entry
- * here (`{ providerId: "grok-github", idp: "github", label: "GitHub" }`). The
- * `providerId` is this app's local id and the OAuth callback path segment
- * (`/api/auth/oauth2/callback/<providerId>`); `idp` is the hint the broker reads
- * to pick the upstream (Better Auth's id for X is still `twitter`).
+ * The `providerId` is this app's local id and the OAuth callback path segment
+ * (`/api/auth/oauth2/callback/<providerId>`) — register exactly that URL as an
+ * authorized redirect URI in Google Cloud Console.
+ *
+ * X was dropped: it only works through the Grok broker, not self-hosted.
  */
 export type GrokProvider = {
   /** This app's local provider id; also the callback path segment. */
@@ -26,6 +28,5 @@ export type GrokProvider = {
 };
 
 export const GROK_PROVIDERS: readonly GrokProvider[] = [
-  { providerId: "grok-google", idp: "google", label: "Google" },
-  { providerId: "grok-x", idp: "twitter", label: "X" },
+  { providerId: "google", idp: "google", label: "Google" },
 ];
