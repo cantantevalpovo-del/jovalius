@@ -27,6 +27,9 @@ export type GateJwks = { keys: JWK[] };
 export type JwksFetch = (url: string) => Promise<GateJwks | null>;
 
 export function gateIdentityEnabled(): boolean {
+  // Self-hosted (own Google OAuth client, see `server.ts`): no Grok gate sits in
+  // front of the app, so never accept `x-grok-identity`.
+  if (env("GOOGLE_CLIENT_ID")) return false;
   return env("VITE_AUTH_ENABLED") !== "false";
 }
 
