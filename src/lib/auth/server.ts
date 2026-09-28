@@ -30,7 +30,7 @@
  * a verified id via `@/lib/auth/middleware`.
  */
 import { betterAuth } from "better-auth";
-import { bearer, genericOAuth } from "better-auth/plugins";
+import { bearer, genericOAuth, type GenericOAuthConfig } from "better-auth/plugins";
 import { tanstackStartCookies } from "better-auth/tanstack-start";
 import { getCookie } from "@tanstack/react-start/server";
 import { randomBytes } from "node:crypto";
@@ -74,16 +74,44 @@ const env = (key: string): string | undefined => {
 // provisions auth; set it to "false" to force auth off everywhere (dev user).
 const authDisabled = env("VITE_AUTH_ENABLED") === "false";
 
+// Self-hosted mode (own Vercel project, outside the Grok platform): the app
+// talks to Google directly with its own OAuth client from Google Cloud Console.
+// The Grok broker only accepts Grok-deployed / `*.grok-sandbox.com` apps, so it
+// cannot be used there. Without these the Grok broker path below stays in use.
+const googleClientId = env("GOOGLE_CLIENT_ID");
+const googleClientSecret = env("GOOGLE_CLIENT_SECRET");
+export const selfHosted = Boolean(googleClientId && googleClientSecret);
+
 // Broker federation creds: the deployer injects a per-app client when deployed;
 // otherwise fall back to the shared live-preview client, which the broker accepts
 // for any `*.grok-sandbox.com` callback (see `./preview`).
 const grokIssuer = env("GROK_AUTH_ISSUER") ?? GROK_ISSUER_DEFAULT;
 const grokClientId = env("GROK_AUTH_CLIENT_ID") ?? PREVIEW_CLIENT_ID;
 const grokClientSecret = env("GROK_AUTH_CLIENT_SECRET") ?? PREVIEW_CLIENT_SECRET;
+const oauthClientId = selfHosted ? googleClientId : grokClientId;
+const oauthClientSecret = selfHosted ? googleClientSecret : grokClientSecret;
 
 /** True when federated sign-in is active (real auth is enforced). */
 export const authConfigured =
-  !authDisabled && Boolean(grokClientId && grokClientSecret);
+  !authDisabled && Boolean(oauthClientId && oauthClientSecret);
+
+// On Vercel (outside the Grok deployer) nothing is injected, and the preview
+// fallbacks below silently break there: an in-memory PGLite per serverless
+// instance, a random secret per instance, and a broker that rejects the host.
+// Fail loudly with the list of what's missing instead of a bare 500.
+if (env("VERCEL") && !authDisabled) {
+  const missing = [
+    !env("DATABASE_URL") && "DATABASE_URL",
+    !env("BETTER_AUTH_SECRET") && "BETTER_AUTH_SECRET",
+    !selfHosted && !env("GROK_AUTH_CLIENT_ID") && "GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET",
+  ].filter(Boolean);
+  if (missing.length > 0) {
+    throw new Error(
+      `[auth] Missing Vercel environment variables: ${missing.join(", ")}. ` +
+        "Add them in Vercel → Settings → Environment Variables and redeploy.",
+    );
+  }
+}
 
 // This app's own Better Auth origin. When deployed the deployer injects the
 // public URL. In the sandbox live preview there's no fixed URL (each preview gets
@@ -91,7 +119,12 @@ export const authConfigured =
 // it derives the origin per-request from the (proxied) host, validated against the
 // preview allowlist, which makes the OAuth `redirect_uri` the concrete preview URL
 // the broker's preview client accepts.
-const explicitBaseURL = env("BETTER_AUTH_URL");
+// On Vercel, fall back to the production domain Vercel exposes (the custom
+// domain once one is attached, else `<project>.vercel.app`).
+const vercelProductionHost = env("VERCEL_PROJECT_PRODUCTION_URL");
+const explicitBaseURL =
+  env("BETTER_AUTH_URL") ??
+  (vercelProductionHost ? `https://${vercelProductionHost}` : undefined);
 // Explicit `string[]` (not a readonly tuple) — Better Auth's DynamicBaseURLConfig
 // requires a mutable `allowedHosts: string[]`.
 const previewAllowedHosts: string[] = [...PREVIEW_ALLOWED_HOSTS];
@@ -136,6 +169,13 @@ const grokAuthorizationUrl = `${issuerBase}/api/auth/oauth2/authorize`;
 const grokTokenUrl = `${issuerBase}/api/auth/oauth2/token`;
 const grokUserInfoUrl = `${issuerBase}/api/auth/oauth2/userinfo`;
 
+// Google's own OIDC endpoints (static, from accounts.google.com discovery).
+const googleEndpoints = {
+  authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+  tokenUrl: "https://oauth2.googleapis.com/token",
+  userInfoUrl: "https://openidconnect.googleapis.com/v1/userinfo",
+};
+
 // Real Postgres when `DATABASE_URL` is set (deployed apps), else the app's
 // embedded PGLite (preview) via a Kysely dialect — so Better Auth persists to the
 // SAME DB as app data, including email/password users. Both use the Better Auth
@@ -152,23 +192,36 @@ export const SESSION_TOKEN_COOKIE = "__Host-grok-auth.session_token";
 // breaking brackets (models often trip on the conditional plugin spread).
 const grokOAuthPlugin = authConfigured
   ? genericOAuth({
-      config: GROK_PROVIDERS.map(({ providerId, idp }) => ({
-        providerId,
-        clientId: grokClientId as string,
-        clientSecret: grokClientSecret as string,
-        // Prefer static endpoints over `discoveryUrl` so initiating (and
-        // completing) OAuth does not wait on a broker discovery fetch.
-        authorizationUrl: grokAuthorizationUrl,
-        tokenUrl: grokTokenUrl,
-        userInfoUrl: grokUserInfoUrl,
-        scopes: ["openid", "profile", "email"],
-        // `prompt: "login"` forces the broker to re-authenticate against the
-        // upstream on every sign-in instead of silently reusing an existing
-        // broker session. Combined with the broker sending Google
-        // `prompt=select_account`, the user always gets the account chooser
-        // and can pick (or switch) which account to sign in with.
-        authorizationUrlParams: { idp, prompt: "login" },
-      })),
+      config: GROK_PROVIDERS.map(({ providerId, idp }): GenericOAuthConfig =>
+        selfHosted
+          ? {
+              providerId,
+              clientId: oauthClientId as string,
+              clientSecret: oauthClientSecret as string,
+              ...googleEndpoints,
+              scopes: ["openid", "profile", "email"],
+              pkce: true,
+              // Always show Google's account chooser so members can switch accounts.
+              authorizationUrlParams: { prompt: "select_account" },
+            }
+          : {
+              providerId,
+              clientId: oauthClientId as string,
+              clientSecret: oauthClientSecret as string,
+              // Prefer static endpoints over `discoveryUrl` so initiating (and
+              // completing) OAuth does not wait on a broker discovery fetch.
+              authorizationUrl: grokAuthorizationUrl,
+              tokenUrl: grokTokenUrl,
+              userInfoUrl: grokUserInfoUrl,
+              scopes: ["openid", "profile", "email"],
+              // `prompt: "login"` forces the broker to re-authenticate against the
+              // upstream on every sign-in instead of silently reusing an existing
+              // broker session. Combined with the broker sending Google
+              // `prompt=select_account`, the user always gets the account chooser
+              // and can pick (or switch) which account to sign in with.
+              authorizationUrlParams: { idp, prompt: "login" },
+            },
+      ),
     })
   : null;
 
